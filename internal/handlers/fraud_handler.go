@@ -1,12 +1,9 @@
 package handlers
 
 import (
-	"context"
-	"encoding/json"
 	"net/http"
 
 	"github.com/gin-gonic/gin"
-	"github.com/nats-io/nats.go"
 	"go.uber.org/zap"
 
 	"github.com/akylbek/payment-system/fraud-service/internal/interfaces"
@@ -27,10 +24,12 @@ func NewFraudHandler(repo interfaces.FraudRepository, checker *service.FraudChec
 	}
 }
 
-func (h *FraudHandler) HandleFraudCheckRequest(msg *nats.Msg) {
+// HandleFraudCheck handles fraud check requests via HTTP
+func (h *FraudHandler) HandleFraudCheck(c *gin.Context) {
 	var req models.FraudCheckRequest
-	if err := json.Unmarshal(msg.Data, &req); err != nil {
-		telemetry.Logger.Error("Error unmarshaling fraud check request", zap.Error(err))
+	if err := c.ShouldBindJSON(&req); err != nil {
+		telemetry.Logger.Error("Error parsing fraud check request", zap.Error(err))
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
 		return
 	}
 
@@ -40,7 +39,7 @@ func (h *FraudHandler) HandleFraudCheckRequest(msg *nats.Msg) {
 		zap.String("customer_id", req.CustomerID),
 	)
 
-	ctx := context.Background()
+	ctx := c.Request.Context()
 	decision := h.checker.CheckFraud(ctx, &req)
 
 	// Save decision to database
@@ -52,15 +51,13 @@ func (h *FraudHandler) HandleFraudCheckRequest(msg *nats.Msg) {
 		)
 	}
 
-	// Send response back via NATS
-	respJSON, _ := json.Marshal(decision)
-	msg.Respond(respJSON)
-
 	telemetry.Logger.Info("Fraud check completed",
 		zap.String("payment_id", req.PaymentID),
 		zap.String("decision", decision.Decision),
 		zap.String("reason", decision.Reason),
 	)
+
+	c.JSON(http.StatusOK, decision)
 }
 
 func (h *FraudHandler) GetFraudStats(c *gin.Context) {
