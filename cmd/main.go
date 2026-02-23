@@ -10,15 +10,12 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/gin-gonic/gin"
 	_ "github.com/lib/pq"
-	"github.com/nats-io/nats.go"
-	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
 
+	"github.com/akylbek/payment-system/fraud-service/internal/api"
 	"github.com/akylbek/payment-system/fraud-service/internal/config"
-	"github.com/akylbek/payment-system/fraud-service/internal/handlers"
 	"github.com/akylbek/payment-system/fraud-service/internal/repository"
 	"github.com/akylbek/payment-system/fraud-service/internal/service"
 	"github.com/akylbek/payment-system/fraud-service/internal/telemetry"
@@ -54,40 +51,16 @@ func main() {
 		Addr: cfg.RedisURL,
 	})
 
-	// Connect to NATS
-	nc, err := nats.Connect(cfg.NatsURL)
-	if err != nil {
-		telemetry.Logger.Fatal("Failed to connect to NATS", zap.Error(err))
-	}
-	defer nc.Close()
-
-	// Initialize service and handlers
+	// Initialize service
 	fraudChecker := service.NewFraudChecker(redisClient)
-	fraudHandler := handlers.NewFraudHandler(fraudRepo, fraudChecker)
 
-	// Subscribe to fraud check requests via NATS
-	nc.Subscribe("fraud.check", fraudHandler.HandleFraudCheckRequest)
-	telemetry.Logger.Info("Subscribed to fraud.check on NATS")
-
-	// Setup Gin router
-	gin.SetMode(gin.ReleaseMode)
-	r := gin.New()
-	r.Use(gin.Recovery())
-	r.Use(telemetry.TracingMiddleware())
-
-	// Prometheus metrics endpoint
-	r.GET("/metrics", gin.WrapH(promhttp.Handler()))
-
-	r.GET("/health", func(c *gin.Context) {
-		c.JSON(http.StatusOK, gin.H{"status": "ok", "service": "fraud-service"})
-	})
-
-	r.GET("/fraud/stats", fraudHandler.GetFraudStats)
+	// Setup router with all routes
+	router := api.NewRouter(fraudRepo, fraudChecker)
 
 	// Setup HTTP server
 	srv := &http.Server{
 		Addr:    ":" + cfg.Port,
-		Handler: r,
+		Handler: router,
 	}
 
 	// Start server in goroutine
