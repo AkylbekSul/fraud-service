@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -13,12 +14,15 @@ import (
 	_ "github.com/lib/pq"
 	"github.com/redis/go-redis/v9"
 	"go.uber.org/zap"
+	"google.golang.org/grpc"
 
 	"github.com/akylbek/payment-system/fraud-service/internal/api"
 	"github.com/akylbek/payment-system/fraud-service/internal/config"
+	grpcserver "github.com/akylbek/payment-system/fraud-service/internal/grpcserver"
 	"github.com/akylbek/payment-system/fraud-service/internal/repository"
 	"github.com/akylbek/payment-system/fraud-service/internal/service"
 	"github.com/akylbek/payment-system/fraud-service/internal/telemetry"
+	fraudpb "github.com/akylbek/payment-system/proto/fraud"
 )
 
 func main() {
@@ -40,6 +44,11 @@ func main() {
 	}
 	defer db.Close()
 
+	// Configure connection pool for high concurrency
+	db.SetMaxOpenConns(30)
+	db.SetMaxIdleConns(15)
+	db.SetConnMaxLifetime(5 * time.Minute)
+
 	// Initialize repository
 	fraudRepo := repository.NewFraudRepository(db)
 	if err := fraudRepo.InitDB(); err != nil {
@@ -48,13 +57,14 @@ func main() {
 
 	// Connect to Redis
 	redisClient := redis.NewClient(&redis.Options{
-		Addr: cfg.RedisURL,
+		Addr:     cfg.RedisURL,
+		PoolSize: 100,
 	})
 
 	// Initialize service
 	fraudChecker := service.NewFraudChecker(redisClient)
 
-	// Setup router with all routes
+	// Setup HTTP router (health, metrics, legacy HTTP endpoints)
 	router := api.NewRouter(fraudRepo, fraudChecker)
 
 	// Setup HTTP server
@@ -63,11 +73,28 @@ func main() {
 		Handler: router,
 	}
 
-	// Start server in goroutine
+	// Start HTTP server in goroutine
 	go func() {
-		telemetry.Logger.Info("Fraud Service starting", zap.String("port", cfg.Port))
+		telemetry.Logger.Info("Fraud Service HTTP starting", zap.String("port", cfg.Port))
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			telemetry.Logger.Fatal("Failed to start server", zap.Error(err))
+			telemetry.Logger.Fatal("Failed to start HTTP server", zap.Error(err))
+		}
+	}()
+
+	// Start gRPC server
+	grpcSrv := grpc.NewServer()
+	fraudGRPCServer := grpcserver.NewFraudGRPCServer(fraudRepo, fraudChecker)
+	fraudpb.RegisterFraudServiceServer(grpcSrv, fraudGRPCServer)
+
+	grpcListener, err := net.Listen("tcp", ":"+cfg.GRPCPort)
+	if err != nil {
+		telemetry.Logger.Fatal("Failed to listen for gRPC", zap.Error(err))
+	}
+
+	go func() {
+		telemetry.Logger.Info("Fraud Service gRPC starting", zap.String("grpc_port", cfg.GRPCPort))
+		if err := grpcSrv.Serve(grpcListener); err != nil {
+			telemetry.Logger.Fatal("Failed to start gRPC server", zap.Error(err))
 		}
 	}()
 
@@ -77,6 +104,10 @@ func main() {
 	<-quit
 
 	telemetry.Logger.Info("Shutting down server...")
+
+	// Graceful shutdown gRPC
+	grpcSrv.GracefulStop()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
