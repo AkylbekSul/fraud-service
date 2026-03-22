@@ -1,38 +1,36 @@
 # Fraud Service
 
-The Fraud Service is a microservice responsible for real-time fraud detection and risk assessment for payment transactions. It uses rule-based checks and behavioral analysis to identify potentially fraudulent activities.
+The Fraud Service is a microservice responsible for real-time fraud detection and risk assessment for payment transactions. It uses rule-based checks and velocity analysis to identify potentially fraudulent activities.
 
 ## Overview
 
 The Fraud Service provides:
 - Real-time fraud detection for payment transactions
-- Risk score calculation based on multiple factors
+- Risk score calculation based on amount thresholds
 - Velocity checks using Redis for rate limiting
 - Fraud statistics and analytics
-- Asynchronous communication via NATS
+- Dual protocol support: HTTP REST and gRPC
 - Historical fraud data storage in PostgreSQL
 
 ## Architecture
 
 ```
-Payment Orchestrator → NATS (fraud.check) → Fraud Service
-                                                  ↓
-                                           Risk Analysis
-                                                  ↓
-                                      Redis (velocity checks)
-                                                  ↓
-                                      PostgreSQL (fraud logs)
-                                                  ↓
-                                    NATS Response (approved/rejected)
+Client / Payment Orchestrator
+        ↓                ↓
+   HTTP (Gin)        gRPC Server
+        ↓                ↓
+     Fraud Checker Service
+        ↓            ↓
+  Redis (velocity)  PostgreSQL (fraud logs)
 ```
 
 ## Technology Stack
 
-- **Language**: Go 1.21+
+- **Language**: Go 1.22
 - **Web Framework**: Gin
-- **Database**: PostgreSQL
-- **Cache**: Redis (for velocity checks)
-- **Message Broker**: NATS (for request/response)
+- **Database**: PostgreSQL (lib/pq)
+- **Cache**: Redis (go-redis v9)
+- **RPC**: gRPC
 - **Observability**: OpenTelemetry + Jaeger + Prometheus
 - **Logging**: Zap (Uber)
 
@@ -43,12 +41,36 @@ The service uses environment variables for configuration:
 | Variable | Description | Default |
 |----------|-------------|---------|
 | `PORT` | HTTP server port | `8083` |
+| `GRPC_PORT` | gRPC server port | `50052` |
 | `DATABASE_URL` | PostgreSQL connection string | Required |
 | `REDIS_URL` | Redis server address | Required |
-| `NATS_URL` | NATS server address | Required |
-| `JAEGER_ENDPOINT` | Jaeger collector endpoint | Optional |
+| `JAEGER_ENDPOINT` | Jaeger collector endpoint | `jaeger:4318` |
 
 ## API Endpoints
+
+### Fraud Check
+```http
+POST /fraud/check
+```
+
+**Request**:
+```json
+{
+  "payment_id": "payment-uuid",
+  "amount": 100.50,
+  "customer_id": "customer-123"
+}
+```
+
+**Response**: `200 OK`
+```json
+{
+  "decision": "approve",
+  "reason": "Transaction approved"
+}
+```
+
+Possible decisions: `approve`, `deny`, `manual_review`
 
 ### Get Fraud Statistics
 ```http
@@ -59,9 +81,10 @@ GET /fraud/stats
 ```json
 {
   "total_checks": 1500,
-  "fraud_detected": 45,
-  "fraud_rate": 0.03,
-  "last_updated": "2026-02-13T10:00:00Z"
+  "approved_count": 1400,
+  "denied_count": 45,
+  "manual_review_count": 55,
+  "avg_risk_score": 25.3
 }
 ```
 
@@ -70,123 +93,105 @@ GET /fraud/stats
 GET /health
 ```
 
-**Response**: `200 OK`
-```json
-{
-  "status": "ok",
-  "service": "fraud-service"
-}
-```
-
 ### Prometheus Metrics
 ```http
 GET /metrics
 ```
 
-## NATS Communication
+## gRPC Service
 
-### Subscribe to: `fraud.check`
+The service exposes a gRPC interface on port 50052:
 
-The service listens for fraud check requests on the `fraud.check` subject.
-
-**Request Message**:
-```json
-{
-  "payment_id": "payment-uuid",
-  "customer_id": "customer-123",
-  "amount": 100.50,
-  "currency": "USD",
-  "merchant_id": "merchant-456"
+```protobuf
+service FraudService {
+  rpc CheckFraud(CheckFraudRequest) returns (CheckFraudResponse);
 }
-```
 
-**Response Message**:
-```json
-{
-  "payment_id": "payment-uuid",
-  "approved": true,
-  "risk_score": 0.15,
-  "reason": "Low risk transaction",
-  "checked_at": "2026-02-13T10:00:00Z"
+message CheckFraudRequest {
+  string payment_id = 1;
+  double amount = 2;
+  string customer_id = 3;
+}
+
+message CheckFraudResponse {
+  string decision = 1;
+  string reason = 2;
 }
 ```
 
 ## Fraud Detection Rules
 
-The service implements multiple fraud detection mechanisms:
+### 1. High Amount Check
+- Transactions over **$10,000** are denied
 
-### 1. Amount-Based Checks
-- **High Amount Threshold**: Transactions over $10,000 are flagged
-- **Unusual Amount Patterns**: Amounts just below reporting thresholds
+### 2. Velocity Check (Redis-based)
+- Maximum **5 transactions per hour** per customer
 
-### 2. Velocity Checks (Redis-based)
-- **Transaction Frequency**: Maximum transactions per customer per time window
-- **Spending Velocity**: Total amount spent in rolling time windows
-- **Geographic Velocity**: Multiple transactions from different locations
-
-Example velocity rules:
-```go
-// Maximum 10 transactions per hour per customer
-// Maximum $5,000 spending per hour per customer
-// Maximum 3 different merchants per 10 minutes
-```
-
-### 3. Behavioral Analysis
-- **First-time Customer**: Higher scrutiny for new accounts
-- **Merchant Risk Profile**: Known high-risk merchant categories
-- **Time-based Patterns**: Unusual transaction times
-
-### 4. Blacklist Checks
-- Customer blacklist
-- Merchant blacklist
-- IP address blacklist (if available)
+### 3. Manual Review Threshold
+- Transactions over **$5,000** are flagged for manual review
 
 ## Risk Score Calculation
 
-Risk scores range from 0.0 (no risk) to 1.0 (high risk):
+Risk scores range from **0 to 100**:
+
+| Condition | Points |
+|-----------|--------|
+| Amount > $1,000 | +30 |
+| Amount > $5,000 | +50 |
+
+## Database Schema
+
+The service uses PostgreSQL with the following tables:
+
+### fraud_decisions
+Stores all fraud check results:
+- `payment_id`, `customer_id` (indexed)
+- `amount`, `decision`, `reason`
+- `risk_score`, `created_at`
+
+### fraud_rules
+Configurable fraud detection rules:
+- `name`, `description`
+- `max_amount`, `max_per_hour`
+- `active`, `priority`
+
+### velocity_counters
+Backup velocity tracking (Redis is primary):
+- `entity_type`, `entity_id`
+- `counter_type`, `count`
+- `window_start`, `window_end`
+
+## Project Structure
 
 ```
-Risk Score = Σ (Rule Weight × Rule Result)
+fraud-service/
+├── cmd/
+│   └── main.go                      # Application entry point
+├── internal/
+│   ├── api/
+│   │   └── router.go                # HTTP routing setup
+│   ├── config/
+│   │   └── config.go                # Configuration management
+│   ├── grpcserver/
+│   │   └── fraud_grpc_server.go     # gRPC service implementation
+│   ├── handlers/
+│   │   └── fraud_handler.go         # HTTP request handlers
+│   ├── interfaces/
+│   │   └── fraud_repository.go      # Repository interface
+│   ├── models/
+│   │   └── fraud.go                 # Domain models
+│   ├── repository/
+│   │   └── fraud_repository.go      # Data access layer
+│   ├── service/
+│   │   └── fraud_checker.go         # Fraud detection logic
+│   └── telemetry/
+│       └── telemetry.go             # OpenTelemetry + Zap setup
+├── migrations/
+│   └── 001_fraud_service_schema.sql # Database schema
+├── Dockerfile
+├── go.mod
+└── README.md
 ```
-
-Example weights:
-- High amount: 0.3
-- High velocity: 0.4
-- Blacklisted: 1.0
-- First-time customer: 0.1
-- High-risk merchant: 0.2
-
-**Thresholds**:
-- `score < 0.3`: Approved
-- `0.3 ≤ score < 0.7`: Review recommended
-- `score ≥ 0.7`: Rejected
-
-## Key Features
-
-### Real-time Processing
-- Sub-100ms average response time
-- Asynchronous via NATS for non-blocking operation
-- Redis-backed velocity checks for performance
-
-### Fraud Logging
-All fraud checks are logged to PostgreSQL:
-```sql
-CREATE TABLE fraud_checks (
-    id SERIAL PRIMARY KEY,
-    payment_id VARCHAR(255) NOT NULL,
-    customer_id VARCHAR(255) NOT NULL,
-    risk_score DECIMAL(5,4) NOT NULL,
-    approved BOOLEAN NOT NULL,
-    reason TEXT,
-    checked_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
-);
-```
-
-### Observability
-- Prometheus metrics for fraud detection rates
-- Distributed tracing with OpenTelemetry
-- Structured logging with correlation IDs
-- Alert on high fraud rates
 
 ## Running the Service
 
@@ -196,13 +201,13 @@ CREATE TABLE fraud_checks (
 ```bash
 export DATABASE_URL="postgresql://user:password@localhost:5432/fraud_service?sslmode=disable"
 export REDIS_URL="localhost:6379"
-export NATS_URL="nats://localhost:4222"
 export PORT="8083"
+export GRPC_PORT="50052"
 ```
 
 2. Run database migrations:
 ```bash
-# Apply migrations from migrations/ directory
+psql $DATABASE_URL -f migrations/001_fraud_service_schema.sql
 ```
 
 3. Start the service:
@@ -212,21 +217,12 @@ go run cmd/main.go
 
 ### Docker
 
-Build and run with Docker:
 ```bash
 docker build -t fraud-service .
-docker run -p 8083:8083 \
+docker run -p 8083:8083 -p 50052:50052 \
   -e DATABASE_URL="..." \
   -e REDIS_URL="..." \
-  -e NATS_URL="..." \
   fraud-service
-```
-
-### Docker Compose
-
-Run as part of the complete system:
-```bash
-docker-compose up fraud-service
 ```
 
 ## Dependencies
@@ -234,152 +230,23 @@ docker-compose up fraud-service
 ### External Services
 - **PostgreSQL**: Fraud check history and analytics
 - **Redis**: Velocity tracking and rate limiting
-- **NATS**: Request/response messaging with orchestrator
 - **Jaeger** (optional): Distributed tracing
 
-### Integration Points
-- **Payment Orchestrator**: Main consumer of fraud checks
-- **Analytics Service**: Can consume fraud statistics
+## Observability
 
-## Monitoring
+- **Tracing**: OpenTelemetry with Jaeger exporter (OTLP HTTP)
+- **Metrics**: Prometheus endpoint at `/metrics`
+- **Logging**: Structured JSON logging via Zap with trace ID correlation (`X-Trace-ID` header)
 
-### Prometheus Metrics
+## Connection Pooling
 
-Custom metrics exposed:
-```
-# Fraud check metrics
-fraud_checks_total{result="approved|rejected"}
-fraud_check_duration_seconds
-fraud_risk_score_histogram
-
-# Velocity metrics
-velocity_checks_total
-velocity_limit_exceeded_total
-
-# System metrics
-http_request_duration_seconds
-http_requests_total
-```
-
-### Key Alerts
-
-Recommended alerts:
-```yaml
-# High fraud rate
-- alert: HighFraudRate
-  expr: rate(fraud_checks_total{result="rejected"}[5m]) > 0.1
-  
-# Slow fraud checks
-- alert: SlowFraudChecks
-  expr: histogram_quantile(0.95, fraud_check_duration_seconds) > 0.1
-
-# Service unavailable
-- alert: FraudServiceDown
-  expr: up{job="fraud-service"} == 0
-```
-
-## Development
-
-### Project Structure
-```
-fraud-service/
-├── cmd/
-│   └── main.go                 # Application entry point
-├── internal/
-│   ├── config/
-│   │   └── config.go           # Configuration management
-│   ├── handlers/
-│   │   └── fraud_handler.go    # NATS and HTTP handlers
-│   ├── interfaces/
-│   │   └── fraud_repository.go # Repository interface
-│   ├── models/
-│   │   └── fraud.go            # Domain models
-│   ├── repository/
-│   │   └── fraud_repository.go # Data access layer
-│   ├── service/
-│   │   └── fraud_checker.go    # Fraud detection logic
-│   └── telemetry/
-│       └── telemetry.go        # Observability setup
-├── migrations/
-│   └── 001_fraud_service_schema.sql
-├── Dockerfile
-└── README.md
-```
-
-### Running Tests
-```bash
-go test ./...
-```
-
-### Adding New Fraud Rules
-
-To add a new fraud detection rule:
-
-1. Implement the check in `internal/service/fraud_checker.go`
-2. Add appropriate weight to risk score calculation
-3. Update unit tests
-4. Update documentation
-
-Example:
-```go
-func (fc *FraudChecker) CheckNewRule(ctx context.Context, payment *models.Payment) (bool, float64) {
-    // Implement rule logic
-    if ruleViolated {
-        return false, 0.25 // weight
-    }
-    return true, 0.0
-}
-```
-
-## Performance Considerations
-
-### Redis Connection Pooling
-The service uses Redis connection pooling for optimal performance:
-```go
-redis.NewClient(&redis.Options{
-    Addr:         cfg.RedisURL,
-    PoolSize:     100,
-    MinIdleConns: 10,
-})
-```
-
-### Database Query Optimization
-- Indexed columns: `customer_id`, `payment_id`, `checked_at`
-- Connection pooling enabled
-- Prepared statements for repeated queries
-
-### NATS Performance
-- Asynchronous message handling
-- No message queuing delays
-- Automatic reconnection
-
-## Security Considerations
-
-- No sensitive data logged
-- Redis keys expire automatically
-- Database credentials via environment variables
-- Rate limiting on HTTP endpoints
-- Input validation on all requests
+- **PostgreSQL**: 30 max open, 15 max idle, 5min lifetime
+- **Redis**: Pool size 100
 
 ## Graceful Shutdown
 
-The service supports graceful shutdown:
-- Completes in-flight fraud checks
-- Closes NATS connection
-- Closes database connections
-- Flushes metrics and traces
-- 5-second timeout
-
-## Future Enhancements
-
-Potential improvements:
-- Machine learning-based fraud detection
-- Real-time model updates
-- Customer behavior profiling
-- Geographic IP verification
-- Device fingerprinting
-- Graph-based fraud rings detection
+The service handles OS signals (SIGINT/SIGTERM) with a 5-second timeout, closing database and Redis connections cleanly.
 
 ## License
 
-Copyright © 2026
+Copyright 2026
