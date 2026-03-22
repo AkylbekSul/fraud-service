@@ -2,6 +2,7 @@ package service
 
 import (
 	"context"
+	"time"
 
 	"github.com/redis/go-redis/v9"
 
@@ -18,39 +19,39 @@ func NewFraudChecker(redisClient *redis.Client) *FraudChecker {
 
 func (f *FraudChecker) CheckFraud(ctx context.Context, req *models.FraudCheckRequest) *models.FraudCheckResponse {
 	// Все проверки отключены - всегда принимаем платеж
-	//
+
 	// Можно включить проверки при необходимости:
-	//
+
 	// Rule 1: High amount check (отключено)
-	// if req.Amount > 10000 {
-	// 	return &models.FraudCheckResponse{
-	// 		Decision: "deny",
-	// 		Reason:   "Amount exceeds $10,000 limit",
-	// 	}
-	// }
-	//
+	if req.Amount > 10000 {
+		return &models.FraudCheckResponse{
+			Decision: "deny",
+			Reason:   "Amount exceeds $10,000 limit",
+		}
+	}
+
 	// Rule 2: Velocity check (отключено)
-	// velocityKey := "fraud:velocity:" + req.CustomerID
-	// count, err := f.redisClient.Incr(ctx, velocityKey).Result()
-	// if err == nil {
-	// 	if count == 1 {
-	// 		f.redisClient.Expire(ctx, velocityKey, time.Hour)
-	// 	}
-	// 	if count > 5 {
-	// 		return &models.FraudCheckResponse{
-	// 			Decision: "deny",
-	// 			Reason:   "Too many payments in the last hour (velocity check failed)",
-	// 		}
-	// 	}
-	// }
-	//
+	velocityKey := "fraud:velocity:" + req.CustomerID
+	count, err := f.redisClient.Incr(ctx, velocityKey).Result()
+	if err == nil {
+		if count == 1 {
+			f.redisClient.Expire(ctx, velocityKey, time.Hour)
+		}
+		if count > 5 {
+			return &models.FraudCheckResponse{
+				Decision: "deny",
+				Reason:   "Too many payments in the last hour (velocity check failed)",
+			}
+		}
+	}
+
 	// Rule 3: High-value manual review (отключено)
-	// if req.Amount > 5000 {
-	// 	return &models.FraudCheckResponse{
-	// 		Decision: "manual_review",
-	// 		Reason:   "High-value transaction requires manual review",
-	// 	}
-	// }
+	if req.Amount > 5000 {
+		return &models.FraudCheckResponse{
+			Decision: "manual_review",
+			Reason:   "High-value transaction requires manual review",
+		}
+	}
 
 	return &models.FraudCheckResponse{
 		Decision: "approve",

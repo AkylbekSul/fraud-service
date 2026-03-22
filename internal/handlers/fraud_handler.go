@@ -63,6 +63,7 @@ func (h *FraudHandler) HandleFraudCheck(c *gin.Context) {
 func (h *FraudHandler) GetFraudStats(c *gin.Context) {
 	stats, err := h.repo.GetStats(c.Request.Context())
 	if err != nil {
+		telemetry.Logger.Error("Failed to fetch fraud stats", zap.Error(err))
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to fetch fraud stats"})
 		return
 	}
